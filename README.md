@@ -1,0 +1,1 @@
+# checklist-equipos-streamlit
