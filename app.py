@@ -21,10 +21,6 @@ from reportlab.platypus import (
     Image as RLImage, PageBreak
 )
 from reportlab.lib.enums import TA_CENTER
-from reportlab.graphics.shapes import Drawing, String
-from reportlab.graphics.charts.piecharts import Pie
-from reportlab.graphics.charts.barcharts import VerticalBarChart
-from reportlab.graphics.charts.legends import Legend
 
 
 # ---------------------------
@@ -42,42 +38,42 @@ STATUS_OPCIONES = ["OPERATIVO", "OPERATIVO CON FALLA", "INOPERATIVO"]
 
 
 # ---------------------------
-# GOOGLE CLIENTS (Streamlit Secrets) - IMPORTS "LAZY" PARA NO CRASHEAR
+# GOOGLE CLIENTS (Streamlit Secrets)
+#  - Soporta [gcp_service_account] (RECOMENDADO)
+#  - Soporta fallback GCP_SA_JSON (si lo dejas, pero lo ideal es borrarlo)
 # ---------------------------
 @st.cache_resource
 def get_google_clients():
-    # Importaciones aquí para evitar ModuleNotFoundError en el import global
     try:
         import gspread
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
     except Exception as e:
-        # devolvemos None y mostraremos el error en debug_google()
         return None, None, None, f"Faltan librerías Google/gspread: {e}"
 
-    sa_json_raw = st.secrets.get("GCP_SA_JSON", None)
     sheet_id = (st.secrets.get("SHEET_ID", "") or "").strip()
+    if not sheet_id:
+        return None, None, None, "Falta SECRET: SHEET_ID"
 
-    if not sa_json_raw or not sheet_id:
-        return None, None, None, "Faltan Secrets: GCP_SA_JSON o SHEET_ID"
+    # ✅ NUEVO: leer SA desde Secrets TOML: [gcp_service_account]
+    info = st.secrets.get("gcp_service_account", None)
 
-    # GCP_SA_JSON puede venir como string o como dict (según cómo lo pegues)
-    try:
-        if isinstance(sa_json_raw, str):
-            info = json.loads(sa_json_raw)
-        elif isinstance(sa_json_raw, dict):
-            info = sa_json_raw
-        else:
-            return None, None, None, "GCP_SA_JSON tiene formato inválido"
-    except Exception as e:
-        return None, None, None, f"JSON inválido en GCP_SA_JSON: {e}"
+    # Fallback (NO recomendado): leer string JSON
+    if not info:
+        sa_json_raw = st.secrets.get("GCP_SA_JSON", None)
+        if not sa_json_raw:
+            return None, None, None, "Falta SECRET: gcp_service_account (recomendado) o GCP_SA_JSON"
+        try:
+            info = json.loads(sa_json_raw) if isinstance(sa_json_raw, str) else sa_json_raw
+        except Exception as e:
+            return None, None, None, f"JSON inválido en GCP_SA_JSON: {e}"
 
     scopes = [
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets",
     ]
     try:
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        creds = Credentials.from_service_account_info(dict(info), scopes=scopes)
         gc = gspread.authorize(creds)
         drive = build("drive", "v3", credentials=creds)
         return gc, drive, sheet_id, None
@@ -88,16 +84,21 @@ def get_google_clients():
 def debug_google():
     st.sidebar.markdown("## 🔧 Diagnóstico Google")
 
-    has_json = bool(st.secrets.get("GCP_SA_JSON", None))
+    has_toml_sa = bool(st.secrets.get("gcp_service_account", None))
+    has_json_sa = bool(st.secrets.get("GCP_SA_JSON", None))
     has_sheet = bool((st.secrets.get("SHEET_ID", "") or "").strip())
 
-    st.sidebar.write("GCP_SA_JSON:", "✅" if has_json else "❌")
+    st.sidebar.write("gcp_service_account:", "✅" if has_toml_sa else "❌")
+    st.sidebar.write("GCP_SA_JSON:", "✅" if has_json_sa else "❌")
     st.sidebar.write("SHEET_ID:", "✅" if has_sheet else "❌")
+
+    if has_json_sa and not has_toml_sa:
+        st.sidebar.warning("⚠️ Estás usando GCP_SA_JSON. Si te da error, bórralo y usa gcp_service_account (TOML).")
 
     gc, drive, sheet_id, err = get_google_clients()
     if err:
         st.sidebar.error(err)
-        st.sidebar.info("Revisa: Python 3.11 + requirements + Secrets.")
+        st.sidebar.info("Revisa: Secrets + permisos del Service Account + carpetas compartidas.")
         return
 
     try:
@@ -118,6 +119,9 @@ def debug_google():
         st.sidebar.code(str(e))
 
 
+# ---------------------------
+# DRIVE HELPERS
+# ---------------------------
 def extract_drive_file_id(url_or_id: str) -> str:
     if not url_or_id:
         return ""
@@ -136,7 +140,6 @@ def upload_file_to_drive(local_path: str, folder_id: str) -> str:
     if not local_path or not os.path.exists(local_path) or not folder_id:
         return ""
 
-    # importar aquí también para no crashear
     try:
         from googleapiclient.http import MediaFileUpload
     except Exception:
