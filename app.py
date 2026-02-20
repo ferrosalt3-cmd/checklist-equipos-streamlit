@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import tempfile
+import time
 from datetime import datetime, date, timedelta
 from hashlib import pbkdf2_hmac
 from typing import Dict, List, Tuple, Optional
@@ -40,44 +41,99 @@ ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "1996")
 
 STATUS_OPCIONES = ["OPERATIVO", "OPERATIVO CON FALLA", "INOPERATIVO"]
 
+# Drive folders (ids)
+DRIVE_PDFS_ID = (st.secrets.get("DRIVE_PDFS_ID", "") or "").strip()
+DRIVE_PHOTOS_ID = (st.secrets.get("DRIVE_PHOTOS_ID", "") or "").strip()
+DRIVE_SIGNATURES_ID = (st.secrets.get("DRIVE_SIGNATURES_ID", "") or "").strip()
+
+# Sheet
+SHEET_ID = (st.secrets.get("SHEET_ID", "") or "").strip()
+
 
 # ---------------------------
-# GOOGLE CLIENTS (Streamlit Secrets)
+# RETRIES / SAFE CALLS
+# ---------------------------
+def _sleep_backoff(attempt: int, base: float = 0.8, cap: float = 6.0):
+    # attempt: 0..N
+    delay = min(cap, base * (2 ** attempt))
+    time.sleep(delay)
+
+
+def _is_quota_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("quota" in m) or ("429" in m) or ("rate limit" in m) or ("too many requests" in m)
+
+
+def _safe_retry(callable_fn, max_tries: int = 4, what: str = "operación"):
+    last_err = None
+    for i in range(max_tries):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if _is_quota_error(msg) and i < max_tries - 1:
+                _sleep_backoff(i)
+                continue
+            raise
+    raise last_err
+
+
+# ---------------------------
+# GOOGLE CLIENTS (Secrets) - IMPORTS LAZY
 # ---------------------------
 @st.cache_resource
 def get_google_clients():
+    """
+    Devuelve: (gc, drive, sheet_id, err)
+    Soporta:
+      - st.secrets["gcp_service_account"] (RECOMENDADO)
+      - st.secrets["GCP_SA_JSON"] (string o dict)
+    """
     try:
         import gspread
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
     except Exception as e:
-        return None, None, None, f"Faltan librerías Google: {e}"
+        return None, None, None, f"Faltan librerías Google/gspread: {e}"
 
-    sa_json_raw = st.secrets.get("GCP_SA_JSON", None)
-    sheet_id = (st.secrets.get("SHEET_ID", "") or "").strip()
+    if not SHEET_ID:
+        return None, None, None, "Falta SECRET: SHEET_ID"
 
-    if not sa_json_raw or not sheet_id:
-        return None, None, None, "Faltan Secrets: GCP_SA_JSON o SHEET_ID"
+    info = None
 
-    try:
-        if isinstance(sa_json_raw, str):
-            info = json.loads(sa_json_raw)
-        elif isinstance(sa_json_raw, dict):
-            info = sa_json_raw
-        else:
-            return None, None, None, "GCP_SA_JSON tiene formato inválido"
-    except Exception as e:
-        return None, None, None, f"JSON inválido en GCP_SA_JSON: {e}"
+    # 1) Recomendado: gcp_service_account como dict (TOML)
+    sa_info = st.secrets.get("gcp_service_account", None)
+    if isinstance(sa_info, dict) and sa_info.get("client_email"):
+        info = dict(sa_info)
+
+    # 2) Alternativo: GCP_SA_JSON (string JSON o dict)
+    if info is None:
+        sa_json_raw = st.secrets.get("GCP_SA_JSON", None)
+        if sa_json_raw:
+            try:
+                if isinstance(sa_json_raw, str):
+                    info = json.loads(sa_json_raw)
+                elif isinstance(sa_json_raw, dict):
+                    info = sa_json_raw
+                else:
+                    return None, None, None, "GCP_SA_JSON tiene formato inválido"
+            except Exception as e:
+                return None, None, None, f"JSON inválido en GCP_SA_JSON: {e}"
+
+    if info is None:
+        return None, None, None, "Falta SECRET: gcp_service_account (recomendado) o GCP_SA_JSON"
 
     scopes = [
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets",
     ]
+
     try:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         gc = gspread.authorize(creds)
-        drive = build("drive", "v3", credentials=creds)
-        return gc, drive, sheet_id, None
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return gc, drive, SHEET_ID, None
     except Exception as e:
         return None, None, None, f"No se pudo autenticar con Google: {e}"
 
@@ -85,30 +141,37 @@ def get_google_clients():
 def debug_google():
     st.sidebar.markdown("## 🔧 Diagnóstico Google")
 
-    has_json = bool(st.secrets.get("GCP_SA_JSON", None))
-    has_sheet = bool((st.secrets.get("SHEET_ID", "") or "").strip())
+    has_sheet = bool(SHEET_ID)
+    has_sa_dict = isinstance(st.secrets.get("gcp_service_account", None), dict)
+    has_sa_json = bool(st.secrets.get("GCP_SA_JSON", None))
 
-    st.sidebar.write("GCP_SA_JSON:", "✅" if has_json else "❌")
+    st.sidebar.write("gcp_service_account:", "✅" if has_sa_dict else "❌")
+    st.sidebar.write("GCP_SA_JSON:", "✅" if has_sa_json else "❌")
     st.sidebar.write("SHEET_ID:", "✅" if has_sheet else "❌")
 
     gc, drive, sheet_id, err = get_google_clients()
     if err:
         st.sidebar.error(err)
-        st.sidebar.info("Revisa: Secrets + requirements.")
+        st.sidebar.info("Si usas Streamlit Cloud: usa gcp_service_account (TOML) en Secrets.")
         return
 
+    # probar listado hojas y escritura simple
     try:
-        sh = gc.open_by_key(sheet_id)
+        def _open():
+            sh = gc.open_by_key(sheet_id)
+            return sh
+
+        sh = _safe_retry(_open, what="abrir spreadsheet")
         ws_names = [w.title for w in sh.worksheets()]
         st.sidebar.success("Conectado a Google ✅")
         st.sidebar.write("Hojas:", ws_names)
 
         if st.sidebar.button("✅ Probar escritura en 'reports'"):
-            ws = sh.worksheet("reports")
-            ws.append_row(
-                ["TEST", "ok", datetime.now().isoformat(timespec="seconds")],
-                value_input_option="USER_ENTERED",
-            )
+            def _append():
+                ws = sh.worksheet("reports")
+                ws.append_row(["TEST", "ok", datetime.now().isoformat(timespec="seconds")], value_input_option="USER_ENTERED")
+
+            _safe_retry(_append, what="append reports")
             st.sidebar.success("OK: se agregó una fila TEST en reports.")
     except Exception as e:
         st.sidebar.error("Error accediendo Sheet:")
@@ -133,8 +196,14 @@ def extract_drive_file_id(url_or_id: str) -> str:
 
 
 def upload_file_to_drive(local_path: str, folder_id: str) -> str:
+    """
+    Sube a Drive con subida NO-resumable (menos errores).
+    Reintenta en 429/quota.
+    Si falla, devuelve "" y el caller hace fallback al path local.
+    """
     if not local_path or not os.path.exists(local_path) or not folder_id:
         return ""
+
     try:
         from googleapiclient.http import MediaFileUpload
     except Exception:
@@ -144,17 +213,17 @@ def upload_file_to_drive(local_path: str, folder_id: str) -> str:
     if err or not drive:
         return ""
 
-    metadata = {"name": os.path.basename(local_path), "parents": [folder_id]}
-    media = MediaFileUpload(local_path, resumable=True)
+    def _do():
+        metadata = {"name": os.path.basename(local_path), "parents": [folder_id]}
+        media = MediaFileUpload(local_path, resumable=False)  # clave
+        created = drive.files().create(body=metadata, media_body=media, fields="id").execute()
+        fid = created.get("id", "")
+        return f"https://drive.google.com/file/d/{fid}/view" if fid else ""
 
-    created = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id",
-    ).execute()
-
-    fid = created.get("id", "")
-    return f"https://drive.google.com/file/d/{fid}/view" if fid else ""
+    try:
+        return _safe_retry(_do, max_tries=4, what="subir archivo a Drive")
+    except Exception:
+        return ""
 
 
 def download_drive_file(file_id_or_url: str, suffix: str = "") -> str:
@@ -174,14 +243,23 @@ def download_drive_file(file_id_or_url: str, suffix: str = "") -> str:
     fd, out_path = tempfile.mkstemp(suffix=suffix or ".bin")
     os.close(fd)
 
-    request = drive.files().get_media(fileId=file_id)
-    with open(out_path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+    def _do():
+        request = drive.files().get_media(fileId=file_id)
+        with open(out_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return out_path
 
-    return out_path
+    try:
+        return _safe_retry(_do, max_tries=4, what="descargar archivo de Drive")
+    except Exception:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+        return ""
 
 
 # ---------------------------
@@ -214,12 +292,15 @@ REPORTS_HEADERS = [
 REPORT_ITEMS_HEADERS = ["report_id", "seccion", "item", "estado", "observacion", "foto_path"]
 
 
-def ensure_sheet_exists(sheet_name: str, headers: list) -> Tuple[bool, str]:
+def ensure_sheet_exists(sheet_name: str, headers: list):
     gc, _, sheet_id, err = get_google_clients()
     if err or not gc:
         return False, f"No hay conexión a Google: {err or 'desconocido'}"
 
-    sh = gc.open_by_key(sheet_id)
+    def _open():
+        return gc.open_by_key(sheet_id)
+
+    sh = _safe_retry(_open, what="abrir spreadsheet")
 
     try:
         ws = sh.worksheet(sheet_name)
@@ -228,37 +309,32 @@ def ensure_sheet_exists(sheet_name: str, headers: list) -> Tuple[bool, str]:
         ws.append_row(headers, value_input_option="RAW")
         return True, f"Hoja '{sheet_name}' creada con headers."
 
-    # OJO: aquí era donde se te caía. Lo hacemos tolerante.
+    # leer headers
     try:
-        first_row = ws.row_values(1)
+        first_row = _safe_retry(lambda: ws.row_values(1), what=f"leer headers {sheet_name}")
     except Exception as e:
-        return False, (
-            f"⚠️ No pude leer headers de '{sheet_name}'.\n"
-            f"Error: {e}\n"
-            f"(Tu app igual seguirá, pero revisa permisos/protecciones de esa hoja.)"
-        )
+        return False, f"Error leyendo headers de '{sheet_name}': {e}"
 
-    if [h.strip() for h in first_row] != headers:
+    normalized = [h.strip() for h in first_row]
+    if normalized != headers:
+        # NO crashear la app: solo advertir fuerte
         return False, (
             f"⚠️ La hoja '{sheet_name}' existe pero los headers NO coinciden.\n"
             f"Esperado: {headers}\n"
-            f"Actual:   {first_row}\n"
-            f"Solución: pega los headers esperados en la fila 1 (sin cambiar nombres)."
+            f"Actual:   {normalized}\n"
+            f"Solución: pega EXACTO los headers esperados en la fila 1 (misma ortografía)."
         )
+
     return True, f"Hoja '{sheet_name}' OK."
 
 
 def init_google_schema():
-    msgs = []
-    for name, hdr in [
-        ("users", USERS_HEADERS),
-        ("reports", REPORTS_HEADERS),
-        ("report_items", REPORT_ITEMS_HEADERS),
-    ]:
-        ok, msg = ensure_sheet_exists(name, hdr)
-        msgs.append((ok, msg))
-
-    for ok, msg in msgs:
+    results = [
+        ensure_sheet_exists("users", USERS_HEADERS),
+        ensure_sheet_exists("reports", REPORTS_HEADERS),
+        ensure_sheet_exists("report_items", REPORT_ITEMS_HEADERS),
+    ]
+    for ok, msg in results:
         if not ok:
             st.warning(msg)
 
@@ -267,21 +343,29 @@ def append_row_sheet(sheet_name: str, row: list):
     gc, _, sheet_id, err = get_google_clients()
     if err or not gc:
         return
-    sh = gc.open_by_key(sheet_id)
+
+    sh = _safe_retry(lambda: gc.open_by_key(sheet_id), what="abrir spreadsheet")
     ws = sh.worksheet(sheet_name)
-    ws.append_row(row, value_input_option="USER_ENTERED")
+
+    def _do():
+        ws.append_row(row, value_input_option="USER_ENTERED")
+
+    _safe_retry(_do, what=f"append {sheet_name}")
 
 
 def sheet_records(sheet_name: str) -> list:
+    """
+    Devuelve lista de dicts. Si hay error (quota/429), devuelve [] sin romper la app.
+    """
     gc, _, sheet_id, err = get_google_clients()
     if err or not gc:
         return []
-    sh = gc.open_by_key(sheet_id)
-    ws = sh.worksheet(sheet_name)
+
     try:
-        return ws.get_all_records()
+        sh = _safe_retry(lambda: gc.open_by_key(sheet_id), what="abrir spreadsheet")
+        ws = sh.worksheet(sheet_name)
+        return _safe_retry(lambda: ws.get_all_records(), what=f"get_all_records {sheet_name}")
     except Exception:
-        # Si hay headers raros, no reventamos toda la app
         return []
 
 
@@ -289,26 +373,42 @@ def find_row_index_by_value(sheet_name: str, col_name: str, value: str) -> int:
     gc, _, sheet_id, err = get_google_clients()
     if err or not gc:
         return 0
-    sh = gc.open_by_key(sheet_id)
+
+    sh = _safe_retry(lambda: gc.open_by_key(sheet_id), what="abrir spreadsheet")
     ws = sh.worksheet(sheet_name)
-    headers = ws.row_values(1)
+
+    headers = _safe_retry(lambda: ws.row_values(1), what=f"row_values {sheet_name}")
     if col_name not in headers:
         return 0
+
     col = headers.index(col_name) + 1
-    cell = ws.find(str(value), in_column=col)
-    return cell.row if cell else 0
+
+    def _do_find():
+        cell = ws.find(str(value), in_column=col)
+        return cell.row if cell else 0
+
+    try:
+        return _safe_retry(_do_find, what=f"find {sheet_name}.{col_name}")
+    except Exception:
+        return 0
 
 
 def update_row_by_headers(sheet_name: str, row_idx: int, updates: dict):
     gc, _, sheet_id, err = get_google_clients()
     if err or not gc or not row_idx:
         return
-    sh = gc.open_by_key(sheet_id)
+
+    sh = _safe_retry(lambda: gc.open_by_key(sheet_id), what="abrir spreadsheet")
     ws = sh.worksheet(sheet_name)
-    headers = ws.row_values(1)
-    for k, v in updates.items():
-        if k in headers:
-            ws.update_cell(row_idx, headers.index(k) + 1, v)
+
+    headers = _safe_retry(lambda: ws.row_values(1), what=f"row_values {sheet_name}")
+
+    def _do():
+        for k, v in updates.items():
+            if k in headers:
+                ws.update_cell(row_idx, headers.index(k) + 1, v)
+
+    _safe_retry(_do, what=f"update {sheet_name}")
 
 
 # ---------------------------
@@ -397,7 +497,7 @@ CHECKLISTS: Dict[str, List[Tuple[str, List[str]]]] = {
 
 
 # ---------------------------
-# LOCAL DIRS
+# AUTH (Users in Sheets)
 # ---------------------------
 def ensure_dirs():
     os.makedirs("data", exist_ok=True)
@@ -407,9 +507,6 @@ def ensure_dirs():
     os.makedirs("assets", exist_ok=True)
 
 
-# ---------------------------
-# AUTH (Users in Sheets)
-# ---------------------------
 def hash_password(password: str, salt: bytes) -> str:
     dk = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120000)
     return base64.b64encode(dk).decode("utf-8")
@@ -418,12 +515,15 @@ def hash_password(password: str, salt: bytes) -> str:
 def init_db():
     ensure_dirs()
 
-    # Schema
+    # crea/verifica sheets
     init_google_schema()
 
-    # Crear admin si no existe
+    # si no existe admin, lo crea (solo si la hoja users responde OK)
     users = sheet_records("users")
+    if users is None:
+        users = []
     exists = any(u.get("username") == ADMIN_USER for u in users)
+
     if not exists:
         salt = os.urandom(16)
         salt_b64 = base64.b64encode(salt).decode("utf-8")
@@ -437,19 +537,27 @@ def init_db():
 def auth_user(username: str, password: str):
     username = username.strip()
     users = sheet_records("users")
+    if not users:
+        return None
+
     row = next((u for u in users if u.get("username") == username and int(u.get("active", 1)) == 1), None)
     if not row:
         return None
-    salt = base64.b64decode(row["salt"])
+
+    try:
+        salt = base64.b64decode(row["salt"])
+    except Exception:
+        return None
+
     pw_hash = hash_password(password, salt)
-    if pw_hash != row["pw_hash"]:
+    if pw_hash != row.get("pw_hash"):
         return None
     return {"username": row["username"], "full_name": row["full_name"], "role": row["role"]}
 
 
 def create_user(username: str, full_name: str, password: str, role: str, active: bool):
     username = username.strip()
-    users = sheet_records("users")
+    users = sheet_records("users") or []
     if any(u.get("username") == username for u in users):
         raise ValueError("Ese usuario ya existe.")
 
@@ -464,7 +572,7 @@ def create_user(username: str, full_name: str, password: str, role: str, active:
 
 
 def fetch_users():
-    users = sheet_records("users")
+    users = sheet_records("users") or []
     users.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     out = []
     for u in users:
@@ -479,7 +587,7 @@ def fetch_users():
 
 
 # ---------------------------
-# REPORTS LOGIC (Sheets)
+# LOGIC (Reports in Sheets)
 # ---------------------------
 def compute_result(items_estado: List[str]) -> Tuple[str, str]:
     if any(s == "INOPERATIVO" for s in items_estado):
@@ -490,36 +598,54 @@ def compute_result(items_estado: List[str]) -> Tuple[str, str]:
 
 
 def save_uploaded_image(uploaded_file, folder: str, prefix: str) -> str:
+    """
+    Guarda local y sube a Drive (si se puede).
+    Si Drive falla por cuota, devuelve path local (y NO revienta la app).
+    """
     if not uploaded_file:
         return ""
+
     ext = os.path.splitext(uploaded_file.name)[1].lower()
     if ext not in [".png", ".jpg", ".jpeg", ".webp"]:
         ext = ".png"
+
     filename = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{ext}"
     local_path = os.path.join("data", folder, filename)
+
     with open(local_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    folder_id = (st.secrets.get("DRIVE_PHOTOS_ID", "") or "").strip()
-    drive_url = upload_file_to_drive(local_path, folder_id)
-    return drive_url or local_path
+    if DRIVE_PHOTOS_ID:
+        drive_url = upload_file_to_drive(local_path, DRIVE_PHOTOS_ID)
+        if drive_url:
+            return drive_url
+
+    return local_path
 
 
 def save_signature_from_canvas(canvas_result, folder: str, prefix: str) -> str:
+    """
+    Guarda local y sube a Drive (si se puede).
+    Si Drive falla por cuota, devuelve path local (y NO revienta la app).
+    """
     if canvas_result is None or canvas_result.image_data is None:
         return ""
+
     img = Image.fromarray(canvas_result.image_data.astype("uint8")).convert("RGBA")
     filename = f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
     local_path = os.path.join("data", folder, filename)
     img.save(local_path)
 
-    folder_id = (st.secrets.get("DRIVE_SIGNATURES_ID", "") or "").strip()
-    drive_url = upload_file_to_drive(local_path, folder_id)
-    return drive_url or local_path
+    if DRIVE_SIGNATURES_ID:
+        drive_url = upload_file_to_drive(local_path, DRIVE_SIGNATURES_ID)
+        if drive_url:
+            return drive_url
+
+    return local_path
 
 
 def next_report_id() -> int:
-    rows = sheet_records("reports")
+    rows = sheet_records("reports") or []
     mx = 0
     for r in rows:
         try:
@@ -565,7 +691,7 @@ def insert_report(payload: dict) -> int:
 
 
 def fetch_pending_reports():
-    rows = sheet_records("reports")
+    rows = sheet_records("reports") or []
     pending = []
     for r in rows:
         if str(r.get("estado", "")).strip().upper() == "PENDIENTE":
@@ -576,6 +702,7 @@ def fetch_pending_reports():
             pending.append({
                 "id": rid,
                 "created_at": r.get("created_at", ""),
+                "created_date": r.get("created_date", ""),
                 "equipment_codigo": r.get("equipment_codigo", ""),
                 "equipment_nombre": r.get("equipment_nombre", ""),
                 "operador_nombre": r.get("operador_nombre", ""),
@@ -587,12 +714,13 @@ def fetch_pending_reports():
 
 
 def fetch_report_detail(report_id: int):
-    reports = sheet_records("reports")
-    rep = next((r for r in reports if str(r.get("report_id", "")) == str(report_id)), None)
+    reports = sheet_records("reports") or []
+    rep = next((r for r in reports if str(r.get("report_id")) == str(report_id)), None)
     if not rep:
         return None, []
-    items_all = sheet_records("report_items")
-    items = [it for it in items_all if str(it.get("report_id", "")) == str(report_id)]
+
+    items_all = sheet_records("report_items") or []
+    items = [it for it in items_all if str(it.get("report_id")) == str(report_id)]
     return rep, items
 
 
@@ -600,6 +728,7 @@ def approve_report(report_id: int, supervisor_user: str, supervisor_nombre: str,
     row_idx = find_row_index_by_value("reports", "report_id", str(report_id))
     if not row_idx:
         return
+
     update_row_by_headers("reports", row_idx, {
         "supervisor_user": supervisor_user,
         "supervisor_nombre": supervisor_nombre,
@@ -611,7 +740,7 @@ def approve_report(report_id: int, supervisor_user: str, supervisor_nombre: str,
 
 
 # ---------------------------
-# PDF STYLES
+# PDF STYLES + PDF FUNCTIONS
 # ---------------------------
 NAVY = colors.HexColor("#0B2A5A")
 styles = getSampleStyleSheet()
@@ -626,7 +755,6 @@ STYLE_SMALL = ParagraphStyle("sm", parent=styles["Normal"], fontSize=9, leading=
 STYLE_SMALL_B = ParagraphStyle("smb", parent=STYLE_SMALL, fontName="Helvetica-Bold")
 
 STYLE_CENTER = ParagraphStyle("c", parent=STYLE_SMALL, alignment=TA_CENTER)
-
 STYLE_CENTER_W = ParagraphStyle("cw", parent=STYLE_CENTER, textColor=colors.white, fontName="Helvetica-Bold")
 STYLE_SMALL_B_W = ParagraphStyle("smbw", parent=STYLE_SMALL_B, textColor=colors.white, fontName="Helvetica-Bold")
 
@@ -634,6 +762,7 @@ STYLE_SMALL_B_W = ParagraphStyle("smbw", parent=STYLE_SMALL_B, textColor=colors.
 def _rl_img(path: str, w_mm: float, h_mm: float):
     if not path:
         return None
+    # Si viene URL Drive -> descargar
     if isinstance(path, str) and path.startswith("http"):
         tmp = download_drive_file(path, suffix=".png")
         if tmp and os.path.exists(tmp):
@@ -645,15 +774,12 @@ def _rl_img(path: str, w_mm: float, h_mm: float):
     return img
 
 
-# ---------------------------
-# PDF: CHECKLIST
-# ---------------------------
 def generate_checklist_pdf(report_id: int) -> str:
     rep, items = fetch_report_detail(report_id)
     if not rep:
         return ""
 
-    pdf_name = f"CHECKLIST_{rep.get('equipment_codigo','')}_{rep.get('created_date','')}.pdf"
+    pdf_name = f"CHECKLIST_{rep.get('equipment_codigo','EQ')}_{rep.get('created_date',date.today().isoformat())}.pdf"
     pdf_path = os.path.join("data", "pdfs", pdf_name)
 
     doc = SimpleDocTemplate(
@@ -729,40 +855,6 @@ def generate_checklist_pdf(report_id: int) -> str:
     story.append(Spacer(1, 4 * mm))
     story.append(Paragraph("<b>Observaciones generales:</b> " + (rep.get("observaciones_generales") or "NINGUNA"), STYLE_SMALL))
 
-    # Fotos (solo si hay)
-    fotos = [(it.get("item",""), it.get("seccion",""), it.get("foto_path","")) for it in items if it.get("foto_path")]
-    if fotos:
-        story.append(Spacer(1, 6 * mm))
-        story.append(Paragraph("Fotos adjuntas (solo ítems con evidencia)", STYLE_H2))
-        grid = []
-        row = []
-        for (item_name, sec, pth) in fotos:
-            cell_story = []
-            cell_story.append(Paragraph(f"<b>{item_name}</b><br/>{sec}", STYLE_SMALL))
-            img = _rl_img(str(pth), 80, 45)
-            if img:
-                cell_story.append(Spacer(1, 2 * mm))
-                cell_story.append(img)
-            row.append(cell_story)
-            if len(row) == 2:
-                grid.append(row)
-                row = []
-        if row:
-            row.append("")
-            grid.append(row)
-
-        photo_tbl = Table(grid, colWidths=[90 * mm, 90 * mm])
-        photo_tbl.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.lightgrey),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        story.append(photo_tbl)
-
     story.append(PageBreak())
     story.append(Paragraph("Firmas", STYLE_H2))
 
@@ -772,7 +864,8 @@ def generate_checklist_pdf(report_id: int) -> str:
     sig_table = Table([
         [Paragraph("Firma Operador", STYLE_SMALL_B_W), Paragraph("Firma Supervisor", STYLE_SMALL_B_W)],
         [op_sig if op_sig else Paragraph("—", STYLE_SMALL), sup_sig if sup_sig else Paragraph("—", STYLE_SMALL)],
-        [Paragraph(rep.get("operador_nombre",""), STYLE_SMALL), Paragraph(rep.get("supervisor_nombre") or SUPERVISOR_NOMBRE_DEFAULT, STYLE_SMALL)]
+        [Paragraph(rep.get("operador_nombre",""), STYLE_SMALL),
+         Paragraph(rep.get("supervisor_nombre") or SUPERVISOR_NOMBRE_DEFAULT, STYLE_SMALL)]
     ], colWidths=[90 * mm, 90 * mm])
 
     sig_table.setStyle(TableStyle([
@@ -791,7 +884,7 @@ def generate_checklist_pdf(report_id: int) -> str:
 
 
 # ---------------------------
-# PDF: GERENCIA
+# PDF: GERENCIA (desde Sheets)
 # ---------------------------
 def _chart_pie_resultados(counts: Dict[str, int], w=180 * mm, h=75 * mm):
     labels = list(counts.keys())
@@ -861,75 +954,82 @@ def _chart_bar(title: str, pairs: List[Tuple[str, int]], w=180 * mm, h=75 * mm, 
     return d
 
 
+def _parse_date_safe(s: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(s))
+    except Exception:
+        return None
+
+
 def generate_gerencia_pdf(start: date, end: date, supervisor_name: str) -> str:
     pdf_path = os.path.join("data", "pdfs", f"INFORME_GERENCIA_{start}_{end}.pdf")
 
-    reports = sheet_records("reports")
-    report_items = sheet_records("report_items")
+    reports = sheet_records("reports") or []
+    report_items = sheet_records("report_items") or []
 
-    # Filtrar por rango
+    # filtrar por rango
     rows = []
     for r in reports:
-        dte = str(r.get("created_date", "")).strip()
+        dte = _parse_date_safe(r.get("created_date", ""))
         if not dte:
             continue
-        try:
-            d_obj = date.fromisoformat(dte)
-        except Exception:
-            continue
-        if start <= d_obj <= end:
+        if start <= dte <= end:
             rows.append(r)
 
+    # KPIs
     total_informes = len(rows)
-    operadores = len(set(str(r.get("operador_nombre","")) for r in rows)) if rows else 0
-    equipos_con_envio = len(set(str(r.get("equipment_codigo","")) for r in rows)) if rows else 0
+    operadores = len(set(r.get("operador_nombre","") for r in rows if r.get("operador_nombre"))) if rows else 0
+    equipos_con_envio = len(set(r.get("equipment_codigo","") for r in rows if r.get("equipment_codigo"))) if rows else 0
     total_equipos = len(EQUIPOS)
     equipos_sin_envio = total_equipos - equipos_con_envio
 
     res_counts = {"APTO": 0, "RESTRICCIONES": 0, "NO APTO": 0}
     falla_count = 0
     for r in rows:
-        res = str(r.get("resultado_final","")).strip()
-        if res in res_counts:
-            res_counts[res] += 1
-        if str(r.get("estado_general","")) in ("FALLA", "INOPERATIVO"):
+        rf = r.get("resultado_final","")
+        res_counts[rf] = res_counts.get(rf, 0) + 1
+        if r.get("estado_general") in ("FALLA", "INOPERATIVO"):
             falla_count += 1
 
     eq_counts = {}
     for r in rows:
-        code = str(r.get("equipment_codigo",""))
-        eq_counts[code] = eq_counts.get(code, 0) + 1
+        code = r.get("equipment_codigo","")
+        if code:
+            eq_counts[code] = eq_counts.get(code, 0) + 1
     top_eq = sorted(eq_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
     op_counts = {}
     for r in rows:
-        op = str(r.get("operador_nombre",""))
-        op_counts[op] = op_counts.get(op, 0) + 1
+        op = r.get("operador_nombre","")
+        if op:
+            op_counts[op] = op_counts.get(op, 0) + 1
     top_op = sorted(op_counts.items(), key=lambda x: x[1], reverse=True)[:10]
 
     day_counts = {}
     for r in rows:
-        dte = str(r.get("created_date",""))
-        day_counts[dte] = day_counts.get(dte, 0) + 1
+        dte = r.get("created_date","")
+        if dte:
+            day_counts[dte] = day_counts.get(dte, 0) + 1
     top_days = sorted(day_counts.items(), key=lambda x: x[0])[-14:]
 
-    # Fotos dentro del rango
-    report_ids_in_range = set(str(r.get("report_id","")) for r in rows)
+    # fotos en el rango (solo items con foto_path)
+    report_ids_in_range = set(str(r.get("report_id")) for r in rows)
     photo_rows = []
     for it in report_items:
-        rid = str(it.get("report_id",""))
-        if rid in report_ids_in_range and str(it.get("foto_path","")).strip():
-            # buscar datos de reporte
-            rep = next((x for x in rows if str(x.get("report_id","")) == rid), None)
-            if rep:
-                photo_rows.append({
-                    "created_date": rep.get("created_date",""),
-                    "equipment_codigo": rep.get("equipment_codigo",""),
-                    "equipment_nombre": rep.get("equipment_nombre",""),
-                    "seccion": it.get("seccion",""),
-                    "item": it.get("item",""),
-                    "foto_path": it.get("foto_path",""),
-                })
+        if str(it.get("report_id")) in report_ids_in_range:
+            fp = (it.get("foto_path") or "").strip()
+            if fp:
+                # buscar info del reporte para mostrar equipo/fecha
+                rep = next((r for r in rows if str(r.get("report_id")) == str(it.get("report_id"))), None)
+                if rep:
+                    photo_rows.append({
+                        "created_date": rep.get("created_date",""),
+                        "equipment_codigo": rep.get("equipment_codigo",""),
+                        "equipment_nombre": rep.get("equipment_nombre",""),
+                        "seccion": it.get("seccion",""),
+                        "item": it.get("item",""),
+                        "foto_path": fp,
+                    })
 
     doc = SimpleDocTemplate(
         pdf_path, pagesize=A4,
@@ -998,14 +1098,8 @@ def generate_gerencia_pdf(start: date, end: date, supervisor_name: str) -> str:
         Paragraph("Estado", STYLE_CENTER_W),
         Paragraph("Resultado", STYLE_CENTER_W),
     ]]
-    # ordenar por fecha desc si se puede
-    def _safe_date(x):
-        try:
-            return date.fromisoformat(str(x.get("created_date","")))
-        except Exception:
-            return date(1970,1,1)
-
-    rows_sorted = sorted(rows, key=_safe_date, reverse=True)
+    # ordenar por fecha desc
+    rows_sorted = sorted(rows, key=lambda r: (r.get("created_date",""), r.get("report_id",0)), reverse=True)
     for r in rows_sorted:
         reg_data.append([
             Paragraph(str(r.get("created_date","")), STYLE_SMALL),
@@ -1046,14 +1140,14 @@ def generate_gerencia_pdf(start: date, end: date, supervisor_name: str) -> str:
                 f"{pr['seccion']}<br/><b>{pr['item']}</b>",
                 STYLE_SMALL
             ))
-            img = _rl_img(str(pr["foto_path"]), 80, 45)
+            img = _rl_img(pr["foto_path"], 80, 45)
             if img:
                 cell_story.append(Spacer(1, 2 * mm))
                 cell_story.append(img)
             else:
                 cell_story.append(Paragraph("Foto no disponible", STYLE_SMALL))
-            row.append(cell_story)
 
+            row.append(cell_story)
             if len(row) == 2:
                 grid.append(row)
                 row = []
@@ -1079,6 +1173,7 @@ def generate_gerencia_pdf(start: date, end: date, supervisor_name: str) -> str:
         if row:
             row.append("")
             grid.append(row)
+
         if grid:
             photo_tbl = Table(grid, colWidths=[90 * mm, 90 * mm])
             photo_tbl.setStyle(TableStyle([
@@ -1097,7 +1192,7 @@ def generate_gerencia_pdf(start: date, end: date, supervisor_name: str) -> str:
 
 
 # ---------------------------
-# UI
+# UI HELPERS
 # ---------------------------
 def sidebar_user():
     name = st.session_state.get("full_name")
@@ -1157,6 +1252,9 @@ def _bar_list(title: str, pairs: List[Tuple[str, int]], max_items=10):
         st.markdown(html, unsafe_allow_html=True)
 
 
+# ---------------------------
+# SUPERVISOR UI
+# ---------------------------
 def supervisor_panel():
     st.subheader(f"🧑‍💼 Supervisor: {st.session_state.get('full_name','')}")
     tabs = st.tabs(["Usuarios", "Pendientes", "Panel de control", "Informe Gerencia (PDF)"])
@@ -1190,25 +1288,14 @@ def supervisor_panel():
         if not pending:
             st.info("No hay reportes pendientes.")
         else:
-            options = {f"{p['equipment_nombre']} ({p['equipment_codigo']}) | {p['created_at']} | {p['resultado_final']}": p["id"] for p in pending}
+            options = {
+                f"{p['equipment_nombre']} ({p['equipment_codigo']}) | {p['created_at']} | {p['resultado_final']}": p["id"]
+                for p in pending
+            }
             choice = st.selectbox("Selecciona un informe", list(options.keys()))
             rep_id = options[choice]
 
             rep, items = fetch_report_detail(rep_id)
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write(f"**Equipo:** {rep.get('equipment_nombre','')}")
-                st.write(f"**Código:** {rep.get('equipment_codigo','')}")
-                st.write(f"**Tipo:** {rep.get('equipment_tipo','')}")
-                st.write(f"**Horómetro:** {rep.get('horometro_inicial','')}")
-                st.write(f"**Operador:** {rep.get('operador_nombre','')}")
-            with col2:
-                st.write(f"**Fecha:** {rep.get('created_at','')}")
-                st.write(f"**Resultado:** {rep.get('resultado_final','')}")
-                st.write(f"**Estado:** {rep.get('estado_general','')}")
-                st.write(f"**Obs:** {rep.get('observaciones_generales') or 'NINGUNA'}")
-
             st.dataframe(items, use_container_width=True, hide_index=True)
 
             st.markdown("### Supervisor (firma obligatoria)")
@@ -1231,8 +1318,11 @@ def supervisor_panel():
                     st.error("Firma supervisor obligatoria.")
                 else:
                     pdf_path = generate_checklist_pdf(rep_id)
-                    pdf_folder_id = (st.secrets.get("DRIVE_PDFS_ID", "") or "").strip()
-                    pdf_drive_url = upload_file_to_drive(pdf_path, pdf_folder_id)
+
+                    # subir PDF a Drive (si se puede)
+                    pdf_drive_url = ""
+                    if DRIVE_PDFS_ID:
+                        pdf_drive_url = upload_file_to_drive(pdf_path, DRIVE_PDFS_ID)
 
                     approve_report(rep_id, st.session_state["user"], supervisor_nombre, firma_path, pdf_drive_url)
 
@@ -1242,12 +1332,9 @@ def supervisor_panel():
 
                     try:
                         with open(pdf_path, "rb") as f:
-                            st.download_button(
-                                "⬇️ Descargar PDF",
-                                data=f.read(),
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf"
-                            )
+                            st.download_button("⬇️ Descargar PDF", data=f.read(),
+                                               file_name=os.path.basename(pdf_path),
+                                               mime="application/pdf")
                     except Exception:
                         pass
 
@@ -1263,20 +1350,18 @@ def supervisor_panel():
         else:
             start = today - timedelta(days=30)
 
+        reports = sheet_records("reports") or []
+
+        # filtrar por created_date
         rows = []
-        reports = sheet_records("reports")
         for r in reports:
-            dte = str(r.get("created_date","")).strip()
-            try:
-                d_obj = date.fromisoformat(dte)
-            except Exception:
-                continue
-            if d_obj >= start:
+            dte = _parse_date_safe(r.get("created_date", ""))
+            if dte and dte >= start:
                 rows.append(r)
 
         total = len(rows)
-        operadores = len(set(str(r.get("operador_nombre","")) for r in rows)) if rows else 0
-        equipos_con_envio = len(set(str(r.get("equipment_codigo","")) for r in rows)) if rows else 0
+        operadores = len(set(r.get("operador_nombre","") for r in rows if r.get("operador_nombre"))) if rows else 0
+        equipos_con_envio = len(set(r.get("equipment_codigo","") for r in rows if r.get("equipment_codigo"))) if rows else 0
         total_equipos = len(EQUIPOS)
         equipos_sin_envio = total_equipos - equipos_con_envio
 
@@ -1288,8 +1373,9 @@ def supervisor_panel():
 
         op_counts = {}
         for r in rows:
-            op = str(r.get("operador_nombre",""))
-            op_counts[op] = op_counts.get(op, 0) + 1
+            op = r.get("operador_nombre","")
+            if op:
+                op_counts[op] = op_counts.get(op, 0) + 1
         top_op = sorted(op_counts.items(), key=lambda x: x[1], reverse=True)
 
         eq_counts = {}
@@ -1300,7 +1386,7 @@ def supervisor_panel():
 
         falla_counts = {}
         for r in rows:
-            if str(r.get("estado_general","")) in ("FALLA", "INOPERATIVO"):
+            if r.get("estado_general") in ("FALLA", "INOPERATIVO"):
                 k = f"{r.get('equipment_nombre','')} ({r.get('equipment_codigo','')})"
                 falla_counts[k] = falla_counts.get(k, 0) + 1
         top_f = sorted(falla_counts.items(), key=lambda x: x[1], reverse=True)
@@ -1315,14 +1401,11 @@ def supervisor_panel():
 
         res_counts = {"APTO": 0, "RESTRICCIONES": 0, "NO APTO": 0}
         for r in rows:
-            res = str(r.get("resultado_final","")).strip()
-            if res in res_counts:
-                res_counts[res] += 1
+            rf = r.get("resultado_final","")
+            res_counts[rf] = res_counts.get(rf, 0) + 1
 
         st.markdown("### Resumen Resultados")
-        st.write(
-            f"✅ APTO: **{res_counts['APTO']}**  |  ⚠️ RESTRICCIONES: **{res_counts['RESTRICCIONES']}**  |  ⛔ NO APTO: **{res_counts['NO APTO']}**"
-        )
+        st.write(f"✅ APTO: **{res_counts.get('APTO',0)}**  |  ⚠️ RESTRICCIONES: **{res_counts.get('RESTRICCIONES',0)}**  |  ⛔ NO APTO: **{res_counts.get('NO APTO',0)}**")
 
     with tabs[3]:
         st.markdown("## Informe para Gerencia (PDF)")
@@ -1341,22 +1424,27 @@ def supervisor_panel():
         if st.button("📄 Generar Informe Gerencia (PDF)", key="gen_ger"):
             pdf_path = generate_gerencia_pdf(start, today, supervisor_nombre)
 
-            pdf_folder_id = (st.secrets.get("DRIVE_PDFS_ID", "") or "").strip()
-            pdf_drive_url = upload_file_to_drive(pdf_path, pdf_folder_id)
+            # subir a drive (opcional)
+            pdf_drive_url = ""
+            if DRIVE_PDFS_ID:
+                pdf_drive_url = upload_file_to_drive(pdf_path, DRIVE_PDFS_ID)
 
             st.success("Informe gerencia generado.")
             if pdf_drive_url:
                 st.markdown(f"📄 **Informe en Drive:** {pdf_drive_url}")
 
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Descargar Informe Gerencia (PDF)",
-                    data=f.read(),
-                    file_name=os.path.basename(pdf_path),
-                    mime="application/pdf"
-                )
+            try:
+                with open(pdf_path, "rb") as f:
+                    st.download_button("⬇️ Descargar Informe Gerencia (PDF)", data=f.read(),
+                                       file_name=os.path.basename(pdf_path),
+                                       mime="application/pdf")
+            except Exception:
+                pass
 
 
+# ---------------------------
+# OPERATOR UI
+# ---------------------------
 def _reset_operator_checklist_state():
     keys = list(st.session_state.keys())
     for k in keys:
@@ -1427,7 +1515,8 @@ def operator_panel():
                     key=f"{eq['codigo']}::{seccion}::{item}::foto"
                 )
                 if up:
-                    foto_path = save_uploaded_image(up, "photos", f"{eq['codigo']}_{item}".replace(" ", "_")[:40])
+                    safe_prefix = f"{eq['codigo']}_{item}".replace(" ", "_")[:40]
+                    foto_path = save_uploaded_image(up, "photos", safe_prefix)
 
             estados_all.append(estado)
             items_payload.append({
@@ -1487,19 +1576,19 @@ def operator_panel():
         st.success(f"✅ Reporte enviado. ID: {report_id} (pendiente firma supervisor).")
 
 
+# ---------------------------
+# MAIN
+# ---------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
     # Diagnóstico siempre visible
     debug_google()
 
-    # No reventar la UI por schema
-    try:
-        init_db()
-    except Exception as e:
-        st.error("Error inicializando base (Sheets). La app seguirá, pero revisa esto:")
-        st.code(str(e))
+    # Inicializa “DB” (Sheets)
+    init_db()
 
+    # Si no hay sesión -> login
     if not st.session_state.get("user") or not st.session_state.get("role") or not st.session_state.get("full_name"):
         st.session_state.pop("user", None)
         st.session_state.pop("role", None)
